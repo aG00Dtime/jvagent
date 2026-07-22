@@ -328,3 +328,114 @@ def test_ollama_exports_available():
 
     assert EmbExport is OllamaEmbeddingModelAction
     assert LmExport is OllamaLanguageModelAction
+
+
+class _MockImageGetResponse:
+    def __init__(self, content: bytes, status_code: int = 200):
+        self.content = content
+        self.status_code = status_code
+        self.headers: Dict[str, str] = {}
+        self.request = httpx.Request("GET", "http://localhost")
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                "request failed", request=self.request, response=self  # type: ignore[arg-type]
+            )
+
+
+class _MockImageFetchClient:
+    """Mocks httpx.AsyncClient for the image-fetch path (async context manager + get)."""
+
+    def __init__(self, response: Any = None, exception: Exception = None):
+        self._response = response
+        self._exception = exception
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+    async def get(self, *args, **kwargs):
+        if self._exception is not None:
+            raise self._exception
+        return self._response
+
+
+@pytest.mark.asyncio
+async def test_extract_images_passes_through_data_uri(monkeypatch):
+    """Existing data:image;base64 URLs are used as-is — no network fetch."""
+
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("should not fetch a data: URI over the network")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _fail_if_called)
+
+    action = OllamaLanguageModelAction()
+    text, images = await action._extract_images(
+        [
+            {"type": "text", "text": "hi"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+        ]
+    )
+    assert text == "hi"
+    assert images == ["QUJD"]
+
+
+@pytest.mark.asyncio
+async def test_extract_images_fetches_plain_http_url(monkeypatch):
+    """A plain http(s) image URL (not a data: URI) is fetched and base64-encoded.
+
+    Regression test: Ollama's native /api/chat endpoint only accepts inline
+    base64 images, unlike OpenAI's endpoint which fetches a remote URL
+    server-side. Any caller that supplies a plain fetchable URL instead of a
+    pre-encoded data: URI previously had that image silently dropped with
+    only a warning log — the model would then report "no image attached"
+    with no indication why, even though the image genuinely existed and was
+    fetchable. This is exactly what a caller migrating from
+    OpenAILanguageModelAction to OllamaLanguageModelAction would hit if it
+    passes real URLs through unchanged (OpenAI's own vision endpoint accepts
+    them fine).
+    """
+    fake_bytes = b"not-really-a-png-but-bytes-are-bytes"
+    mock_client = _MockImageFetchClient(response=_MockImageGetResponse(fake_bytes))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: mock_client)
+
+    action = OllamaLanguageModelAction()
+    text, images = await action._extract_images(
+        [
+            {"type": "text", "text": "describe"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/id-card.jpg"},
+            },
+        ]
+    )
+    assert text == "describe"
+    assert len(images) == 1
+    import base64
+
+    assert base64.b64decode(images[0]) == fake_bytes
+
+
+@pytest.mark.asyncio
+async def test_extract_images_fetch_failure_is_skipped_not_raised(monkeypatch):
+    """A failed fetch (network error, 404, etc.) degrades to no image rather
+    than crashing the whole model call — matches the pre-existing behavior
+    for unsupported URL formats (warn + skip, not raise)."""
+    mock_client = _MockImageFetchClient(exception=httpx.ConnectError("boom"))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: mock_client)
+
+    action = OllamaLanguageModelAction()
+    text, images = await action._extract_images(
+        [
+            {"type": "text", "text": "describe"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/unreachable.jpg"},
+            },
+        ]
+    )
+    assert text == "describe"
+    assert images == []

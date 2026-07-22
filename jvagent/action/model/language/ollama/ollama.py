@@ -8,6 +8,7 @@ Supports both:
 - Ollama Cloud or other hosted Ollama-native endpoints (API key optional/configurable)
 """
 
+import base64
 import json
 import logging
 import uuid
@@ -102,7 +103,50 @@ class OllamaLanguageModelAction(LanguageModelAction):
         )
         return headers
 
-    def _extract_images(self, content: Any) -> tuple[str, List[str]]:
+    # Guard against pathologically large remote images inflating the request
+    # body / blowing memory when fetched and base64-encoded inline.
+    _MAX_FETCHABLE_IMAGE_BYTES = 20 * 1024 * 1024
+
+    async def _fetch_and_encode_image_url(self, url: str) -> Optional[str]:
+        """Fetch a plain http(s) image URL and return raw base64 (no data-URI
+        prefix), or None on any failure.
+
+        Ollama's native /api/chat endpoint only accepts inline base64 images —
+        unlike OpenAI's endpoint, it cannot fetch a remote URL server-side.
+        Callers upstream (e.g. WhatsApp media handling) usually pre-encode to
+        base64 for exactly this reason, but any caller that instead supplies a
+        plain fetchable URL (not a data: URI) previously had that image
+        silently dropped here with only a warning log — the model would then
+        report "no image attached" with no indication why. Fetch it ourselves
+        so this action's image support isn't stricter than the provider it's
+        replacing.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                content_length = resp.headers.get("content-length")
+                if content_length and int(content_length) > self._MAX_FETCHABLE_IMAGE_BYTES:
+                    logger.warning(
+                        "Ollama: skipping image URL %s — %s bytes exceeds fetch cap",
+                        url,
+                        content_length,
+                    )
+                    return None
+                data = resp.content
+                if len(data) > self._MAX_FETCHABLE_IMAGE_BYTES:
+                    logger.warning(
+                        "Ollama: skipping image URL %s — %d bytes exceeds fetch cap",
+                        url,
+                        len(data),
+                    )
+                    return None
+                return base64.b64encode(data).decode("ascii")
+        except Exception as exc:
+            logger.warning("Ollama: failed to fetch image URL %s: %s", url, exc)
+            return None
+
+    async def _extract_images(self, content: Any) -> tuple[str, List[str]]:
         """Extract text + base64 images from structured content."""
         if isinstance(content, str):
             return content, []
@@ -128,15 +172,20 @@ class OllamaLanguageModelAction(LanguageModelAction):
 
             if url.startswith("data:image") and ";base64," in url:
                 images.append(url.split(";base64,", 1)[1])
+            elif url.startswith("http://") or url.startswith("https://"):
+                fetched = await self._fetch_and_encode_image_url(url)
+                if fetched:
+                    images.append(fetched)
             else:
                 logger.warning(
-                    "Ollama currently supports base64/data URI images in this action; "
-                    f"ignoring unsupported image URL format for action {self.label}"
+                    "Ollama currently supports base64/data URI or http(s) images "
+                    f"in this action; ignoring unsupported image URL format for "
+                    f"action {self.label}"
                 )
 
         return "\n".join([p for p in text_parts if p]), images
 
-    def _to_ollama_messages(
+    async def _to_ollama_messages(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """Convert framework message format to Ollama-native message format.
@@ -154,7 +203,7 @@ class OllamaLanguageModelAction(LanguageModelAction):
             if raw_content is None:
                 content, images = "", []
             else:
-                content, images = self._extract_images(raw_content)
+                content, images = await self._extract_images(raw_content)
             normalized: Dict[str, Any] = {"role": role, "content": content}
             if images:
                 normalized["images"] = images
@@ -304,7 +353,7 @@ class OllamaLanguageModelAction(LanguageModelAction):
                     by_id[tid2] = len(merged) - 1
         return merged
 
-    def _build_payload(
+    async def _build_payload(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
@@ -319,7 +368,7 @@ class OllamaLanguageModelAction(LanguageModelAction):
         }
         payload: Dict[str, Any] = {
             "model": model_override,
-            "messages": self._to_ollama_messages(messages),
+            "messages": await self._to_ollama_messages(messages),
             "stream": stream,
             "options": options,
         }
@@ -356,7 +405,7 @@ class OllamaLanguageModelAction(LanguageModelAction):
     ) -> ModelActionResult:
         """Execute a synchronous query to Ollama."""
         await self._initialize_http_client()
-        payload = self._build_payload(messages, tools, stream=False, **kwargs)
+        payload = await self._build_payload(messages, tools, stream=False, **kwargs)
         model_override = kwargs.get("model", self.model)
 
         try:
@@ -402,7 +451,7 @@ class OllamaLanguageModelAction(LanguageModelAction):
         """Execute a streaming query to Ollama."""
         thinking_queue = kwargs.get("_jv_thinking_queue")
         await self._initialize_http_client()
-        payload = self._build_payload(messages, tools, stream=True, **kwargs)
+        payload = await self._build_payload(messages, tools, stream=True, **kwargs)
         model_override = kwargs.get("model", self.model)
 
         result = ModelActionResult(
